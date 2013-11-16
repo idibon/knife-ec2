@@ -621,6 +621,12 @@ describe Chef::Knife::Ec2ServerCreate do
       
       server_def = @knife_ec2_create.create_server_def
       server_def[:tenancy].should == nil
+
+    it "sets the spot price" do
+      @knife_ec2_create.config[:spot_price] = '1.99'
+      server_def = @knife_ec2_create.create_server_def
+
+      server_def[:price].should == '1.99'
     end
   end
 
