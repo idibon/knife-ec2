@@ -70,6 +70,15 @@ class Chef
       option :associate_eip,
         :long => "--associate-eip IP_ADDRESS",
         :description => "Associate existing elastic IP address with instance after launch"
+      
+      option :dedicated_instance,
+              :long => "--dedicated_instance",
+              :description => "Launch as a Dedicated instance (VPC ONLY)"
+              
+      option :placement_group,
+        :long => "--placement-group PLACEMENT_GROUP",
+        :description => "The placement group to place a cluster compute instance",
+        :proc => Proc.new { |pg| Chef::Config[:knife][:placement_group] = pg }
 
       option :tags,
         :short => "-T T=V[,T=V,...]",
@@ -132,12 +141,18 @@ class Chef
         :long => "--bootstrap-version VERSION",
         :description => "The version of Chef to install",
         :proc => Proc.new { |v| Chef::Config[:knife][:bootstrap_version] = v }
+      
+      option :bootstrap_proxy,
+          :long => "--bootstrap-proxy PROXY_URL",
+          :description => "The proxy server for the node being bootstrapped",
+          :proc => Proc.new { |p| Chef::Config[:knife][:bootstrap_proxy] = p }
 
       option :distro,
         :short => "-d DISTRO",
         :long => "--distro DISTRO",
         :description => "Bootstrap a distro using a template; default is 'chef-full'",
-        :proc => Proc.new { |d| Chef::Config[:knife][:distro] = d }
+        :proc => Proc.new { |d| Chef::Config[:knife][:distro] = d },
+        :default => "chef-full"
 
       option :template_file,
         :long => "--template-file TEMPLATE",
@@ -162,6 +177,17 @@ class Chef
         :long => "--run-list RUN_LIST",
         :description => "Comma separated list of roles/recipes to apply",
         :proc => lambda { |o| o.split(/[\s,]+/) }
+
+      option :secret,
+        :short => "-s SECRET",
+        :long => "--secret ",
+        :description => "The secret key to use to encrypt data bag item values",
+        :proc => lambda { |s| Chef::Config[:knife][:secret] = s }
+
+      option :secret_file,
+        :long => "--secret-file SECRET_FILE",
+        :description => "A file containing the secret key to use to encrypt data bag item values",
+        :proc => lambda { |sf| Chef::Config[:knife][:secret_file] = sf }
 
       option :json_attributes,
         :short => "-j JSON",
@@ -190,7 +216,7 @@ class Chef
         :long => "--bootstrap-protocol protocol",
         :description => "protocol to bootstrap windows servers. options: winrm/ssh",
         :proc => Proc.new { |key| Chef::Config[:knife][:bootstrap_protocol] = key },
-        :default => "winrm"
+        :default => nil
 
       option :fqdn,
         :long => "--fqdn FQDN",
@@ -265,6 +291,10 @@ class Chef
         false
       rescue Errno::EPERM, Errno::ETIMEDOUT
         false
+      # This happens on some mobile phone networks
+      rescue Errno::ECONNRESET
+        sleep 2
+        false
       ensure
         tcp_socket && tcp_socket.close
       end
@@ -335,6 +365,8 @@ class Chef
           hashed_tags["Name"] = locate_config_value(:chef_node_name) || @server.id
         end
 
+        printed_tags = hashed_tags.map{ |tag, val| "#{tag}: #{val}" }.join(", ")
+
         msg_pair("Instance ID", @server.id)
         msg_pair("Flavor", @server.flavor_id)
         msg_pair("Image", @server.image_id)
@@ -355,7 +387,7 @@ class Chef
 
         msg_pair("IAM Profile", locate_config_value(:iam_instance_profile))
 
-        msg_pair("Tags", hashed_tags)
+        msg_pair("Tags", printed_tags)
         msg_pair("SSH Key", @server.key_name)
 
         print "\n#{ui.color("Waiting for instance", :magenta)}"
@@ -366,11 +398,11 @@ class Chef
         puts("\n")
 
         # occasionally 'ready?' isn't, so retry a couple times if needed.
-        tries = 6 
+        tries = 6
         begin
           create_tags(hashed_tags) unless hashed_tags.empty?
           associate_eip(elastic_ip) if config[:associate_eip]
-        rescue Fog::Compute::AWS::NotFound => e
+        rescue Fog::Compute::AWS::NotFound, Fog::Errors::Error => e
           raise if (tries -= 1) <= 0
           ui.warn("server not ready, retrying tag application (retries left: #{tries})")
           sleep 5
@@ -379,6 +411,7 @@ class Chef
 
         if vpc_mode?
           msg_pair("Subnet ID", @server.subnet_id)
+          msg_pair("Tenancy", @server.tenancy)
           if elastic_ip
             msg_pair("Public IP Address", @server.public_ip_address)
           end
@@ -393,6 +426,9 @@ class Chef
         #Check if Server is Windows or Linux
         if is_image_windows?
           protocol = locate_config_value(:bootstrap_protocol)
+          protocol ||= 'winrm'
+          # Set distro to windows-chef-client-msi
+          config[:distro] = "windows-chef-client-msi" if (config[:distro].nil? || config[:distro] == "chef-full")
           if protocol == 'winrm'
             load_winrm_deps
             print "\n#{ui.color("Waiting for winrm", :magenta)}"
@@ -403,27 +439,30 @@ class Chef
           else
             print "\n#{ui.color("Waiting for sshd", :magenta)}"
             #If FreeSSHd, winsshd etc are available
-            print(".") until tcp_test_ssh(ssh_connect_host) {
+            print(".") until tcp_test_ssh(ssh_connect_host, config[:ssh_port]) {
               sleep @initial_sleep_delay ||= (vpc_mode? ? 40 : 10)
               puts("done")
             }
+            ssh_override_winrm
           end
           bootstrap_for_windows_node(@server,ssh_connect_host).run
         else
             wait_for_sshd(ssh_connect_host)
+            ssh_override_winrm
             bootstrap_for_linux_node(@server,ssh_connect_host).run
         end
 
         puts "\n"
         msg_pair("Instance ID", @server.id)
         msg_pair("Flavor", @server.flavor_id)
+        msg_pair("Placement Group", @server.placement_group) unless @server.placement_group.nil?
         msg_pair("Image", @server.image_id)
         msg_pair("Region", connection.instance_variable_get(:@region))
         msg_pair("Availability Zone", @server.availability_zone)
         msg_pair("Security Groups", printed_security_groups) unless vpc_mode? or (@server.groups.nil? and @server.security_group_ids)
         msg_pair("Security Group Ids", printed_security_group_ids) if vpc_mode? or @server.security_group_ids
         msg_pair("IAM Profile", locate_config_value(:iam_instance_profile)) if locate_config_value(:iam_instance_profile)
-        msg_pair("Tags", hashed_tags)
+        msg_pair("Tags", printed_tags)
         msg_pair("SSH Key", @server.key_name)
         msg_pair("Root Device Type", @server.root_device_type)
         if @server.root_device_type == "ebs"
@@ -447,6 +486,7 @@ class Chef
         end
         if vpc_mode?
           msg_pair("Subnet ID", @server.subnet_id)
+          msg_pair("Tenancy", @server.tenancy)
         else
           msg_pair("Public DNS Name", @server.dns_name)
           msg_pair("Public IP Address", @server.public_ip_address)
@@ -460,17 +500,17 @@ class Chef
 
       def bootstrap_common_params(bootstrap)
         bootstrap.config[:run_list] = config[:run_list]
-        bootstrap.config[:prerelease] = config[:prerelease]
         bootstrap.config[:bootstrap_version] = locate_config_value(:bootstrap_version)
         bootstrap.config[:distro] = locate_config_value(:distro)
         bootstrap.config[:template_file] = locate_config_value(:template_file)
         bootstrap.config[:environment] = locate_config_value(:environment)
         bootstrap.config[:prerelease] = config[:prerelease]
-        bootstrap.config[:bootstrap_version] = locate_config_value(:bootstrap_version)
         bootstrap.config[:first_boot_attributes] = locate_config_value(:json_attributes) || {}
         bootstrap.config[:encrypted_data_bag_secret] = locate_config_value(:encrypted_data_bag_secret)
         bootstrap.config[:encrypted_data_bag_secret_file] = locate_config_value(:encrypted_data_bag_secret_file)
-          # Modify global configuration state to ensure hint gets set by
+        bootstrap.config[:secret] = locate_config_value(:secret)
+        bootstrap.config[:secret_file] = locate_config_value(:secret_file)
+        # Modify global configuration state to ensure hint gets set by
         # knife-bootstrap
         Chef::Config[:knife][:hints] ||= {}
         Chef::Config[:knife][:hints]["ec2"] ||= {}
@@ -483,7 +523,7 @@ class Chef
       end
 
       def bootstrap_for_windows_node(server, fqdn)
-        if locate_config_value(:bootstrap_protocol) == 'winrm'
+        if locate_config_value(:bootstrap_protocol) == 'winrm' || locate_config_value(:bootstrap_protocol) == nil
             if locate_config_value(:kerberos_realm)
               #Fetch AD/WINS based fqdn if any for Kerberos-based Auth
               fqdn = locate_config_value(:fqdn) || fetch_server_fqdn(server.private_ip_address)
@@ -522,7 +562,6 @@ class Chef
         bootstrap.config[:ssh_gateway] = config[:ssh_gateway]
         bootstrap.config[:identity_file] = config[:identity_file]
         bootstrap.config[:chef_node_name] = locate_config_value(:chef_node_name) || server.id
-        bootstrap.config[:distro] = locate_config_value(:distro) || "chef-full"
         bootstrap.config[:use_sudo] = true unless config[:ssh_user] == 'root'
         # may be needed for vpc_mode
         bootstrap.config[:host_key_verify] = config[:host_key_verify]
@@ -552,11 +591,17 @@ class Chef
           ui.error("You are using a VPC, security groups specified with '-G' are not allowed, specify one or more security group ids with '-g' instead.")
           exit 1
         end
+        
         if !vpc_mode? and !!config[:private_ip_address]
           ui.error("You can only specify a private IP address if you are using VPC.")
           exit 1
         end
-
+        
+        if config[:dedicated_instance] and !vpc_mode?
+          ui.error("You can only specify a Dedicated Instance if you are using VPC.")
+          exit 1
+        end
+        
         if config[:associate_eip]
           eips = connection.addresses.collect{|addr| addr if addr.domain == eip_scope}.compact
 
@@ -595,7 +640,9 @@ class Chef
         }
         server_def[:subnet_id] = locate_config_value(:subnet_id) if vpc_mode?
         server_def[:private_ip_address] = locate_config_value(:private_ip_address) if vpc_mode?
+        server_def[:placement_group] = locate_config_value(:placement_group)
         server_def[:iam_instance_profile_name] = locate_config_value(:iam_instance_profile)
+        server_def[:tenancy] = "dedicated" if vpc_mode? and locate_config_value(:dedicated_instance)
 
         if Chef::Config[:knife][:aws_user_data]
           begin
@@ -697,6 +744,29 @@ class Chef
       def associate_eip(elastic_ip)
         connection.associate_address(server.id, elastic_ip.public_ip, nil, elastic_ip.allocation_id)
         @server.wait_for { public_ip_address == elastic_ip.public_ip }
+      end
+
+      def ssh_override_winrm
+        # unchanged ssh_user and changed winrm_user, override ssh_user
+        if locate_config_value(:ssh_user).eql?(options[:ssh_user][:default]) &&
+            !locate_config_value(:winrm_user).eql?(options[:winrm_user][:default])
+          config[:ssh_user] = locate_config_value(:winrm_user)
+        end
+        # unchanged ssh_port and changed winrm_port, override ssh_port
+        if locate_config_value(:ssh_port).eql?(options[:ssh_port][:default]) &&
+            !locate_config_value(:winrm_port).eql?(options[:winrm_port][:default])
+          config[:ssh_port] = locate_config_value(:winrm_port)
+        end
+        # unset ssh_password and set winrm_password, override ssh_password
+        if locate_config_value(:ssh_password).nil? &&
+            !locate_config_value(:winrm_password).nil?
+          config[:ssh_password] = locate_config_value(:winrm_password)
+        end
+        # unset identity_file and set kerberos_keytab_file, override identity_file
+        if locate_config_value(:identity_file).nil? &&
+            !locate_config_value(:kerberos_keytab_file).nil?
+          config[:identity_file] = locate_config_value(:kerberos_keytab_file)
+        end
       end
     end
   end
