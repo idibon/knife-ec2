@@ -51,6 +51,11 @@ class Chef
             :description => "Your AWS API Secret Access Key",
             :proc => Proc.new { |key| Chef::Config[:knife][:aws_secret_access_key] = key }
 
+          option :use_iam_credentials,
+            :long => "--use-iam-credentials",
+            :description => "Use the credentials provided by the system IAM role",
+            :proc => Proc.new { Chef::Config[:knife][:use_iam_credentials] = true }
+
           option :region,
             :long => "--region REGION",
             :description => "Your AWS region",
@@ -59,14 +64,21 @@ class Chef
       end
 
       def connection
-        @connection ||= begin
-          connection = Fog::Compute.new(
-            :provider => 'AWS',
+        return @connection if @connection
+        args = {
+         :provider => 'AWS',
+         :region => locate_config_value(:region)
+        }
+        use_iam_credentials = locate_config_value(:use_iam_credentials)
+        if use_iam_credentials
+          args[:use_iam_profile] = true
+        else
+          args.update({
             :aws_access_key_id => Chef::Config[:knife][:aws_access_key_id],
-            :aws_secret_access_key => Chef::Config[:knife][:aws_secret_access_key],
-            :region => locate_config_value(:region)
-          )
+            :aws_secret_access_key => Chef::Config[:knife][:aws_secret_access_key]
+          })
         end
+        @connection = Fog::Compute.new(args)
       end
 
       def locate_config_value(key)
@@ -87,6 +99,7 @@ class Chef
 
       def validate!(keys=[:aws_access_key_id, :aws_secret_access_key])
         errors = []
+        return true if locate_config_value(:use_iam_credentials)
 
         unless Chef::Config[:knife][:aws_credential_file].nil?
           unless (Chef::Config[:knife].keys & [:aws_access_key_id, :aws_secret_access_key]).empty?
